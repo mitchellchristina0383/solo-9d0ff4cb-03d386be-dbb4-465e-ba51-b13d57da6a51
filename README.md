@@ -19,13 +19,14 @@
           └─────────┬──────────┘  (WAL, 卷挂载)  └─────────┬──────────┘
                     └──────────────► cache.db ◄────────────┘
                   表: snapshots(valid/stale) / inflight(租约) / failures(冷却)
+                      / incidents(不可用事件) / anomaly_state / service_health
 ```
 
 - **配置源** (`app/source.py`)：`POST /admin/publish` 每发一次，该服务 `revision + 1`；
   `GET /services/{s}/current` 返回当前修订（轻量、不受故障注入影响）；
   `GET /services/{s}/revisions/{r}` 返回指定修订全量节点（慢/错/挂起只作用在这里）。
 - **缓存实例** (`app/cache.py`)：两个实例共享一个 SQLite 文件，无独立缓存进程，
-  协调状态全部落在共享库的三张表里。
+  协调状态全部落在共享库中（快照/租约/失败冷却/不可用事件）。
 
 ## 关键保证与实现方式
 
@@ -51,6 +52,27 @@
    失败有 3s 冷却（共享，两个实例都快速失败，避免雪崩），冷却过后自动重试。
    `GET /snapshots/{service}` 与 `/snapshots/{service}/revisions/{r}` 在源故障期间仍可读。
    源整体宕机时，已有有效快照的服务降级返回（`degraded=true`），无快照才 503。
+
+6. **不可用事件（incident）：按服务记录"持续不可用"与恢复**
+   两台缓存实例的 `/routes/{service}` 最终返回**降级路由**（`degraded=true`）或
+   `503` 时，在共享库记录该服务的异常轮次：首次异常时间、首次原因、最近原因。
+   持续达到 `INCIDENT_THRESHOLD`（默认 10s）且期间**没有任何一次成功返回已核实
+   的现役路由**，才开启一条事件；同一轮异常只开一条。成功返回现役路由即结案，
+   保留 `started_at`（首次异常）与 `ended_at`（恢复），可计算持续时长。
+
+   - 异常轮次跨实例共享（`anomaly_state` 每个服务一行）：两实例交错请求也只会
+     合成一条事件。
+   - **查询事件时也完成到期判定**：`GET /events`、`GET /events/{service}` 会先对
+     已达阈值的轮次落事件，因此即便期间不再有路由请求，持续异常仍会在查询时
+     被记录。
+   - **迟到异常不开单**：以请求开始时间对比最近一次成功返回现役路由的完成时间，
+     恢复前启动、恢复后才返回的异常不会重新开启事件；恢复后新发起的异常则进入
+     下一轮，可开启新事件。
+   - **写入原子**：异常轮次与事件在同一个 `BEGIN IMMEDIATE` 事务内更新，
+     失败整体回滚，不会留下"有轮次无事件"或半条事件；事件写入失败也不影响
+     路由响应本身。
+   - `409`（慢回源跨修订，提示重试）不属于用户可见的不可用，不参与事件判定。
+   - 现有 `/routes` 响应字段与 `/snapshots` 历史快照的返回语义保持不变。
 
 ## 运行
 
@@ -82,12 +104,18 @@ bash scripts/run_local.sh
    `error` 模拟 5xx；`hang` 模拟挂起；`ok` 恢复
 4. cache → `GET /debug/state` 看 inflight 租约、failures 冷却、snapshots 状态
 5. cache → `GET /snapshots/payments` 看全部历史快照（含 stale）
+6. cache → 持续故障 10s 后 `GET /events/payments` 看不可用事件
+   （`started_at / ended_at / first_reason / last_reason / duration_seconds`），
+   `GET /events?status=open` 看当前未结案事件；恢复后事件自动结案。
 
 ## 自测
 
 ```bash
 .venv/bin/python -I tests/test_integration.py   # 13 项：修订一致性/并发合并/接管/跨修订/故障
 .venv/bin/python -I tests/test_edge.py          # 边界：源宕机降级、404、发布交错单调性
+.venv/bin/python -I tests/test_incidents.py     # 不可用事件：交错/失联/迟到/恢复/到期判定
+.venv/bin/python -I tests/test_incidents_concurrency.py  # 两实例并发：单事件/单次结案/多轮
+.venv/bin/python -I tests/test_incidents_unit.py  # 不可用事件：事务回滚/并发幂等/迟到边界
 ```
 
 ## 环境变量（cache）
@@ -101,3 +129,4 @@ bash scripts/run_local.sh
 | `LEASE_TTL` | `2` | 租约有效期秒数 |
 | `HEARTBEAT_INTERVAL` | `0.7` | 续租间隔秒数 |
 | `FAILURE_COOLDOWN` | `3` | 失败冷却秒数 |
+| `INCIDENT_THRESHOLD` | `10` | 不可用事件判定阈值（持续异常秒数；期间无成功才开单） |
